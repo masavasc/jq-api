@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/jquants/cron-alerts?secret=YOUR_SECRET",
+      "schedule": "10 7 * * 2,5"
+    }
+  ]
+}
