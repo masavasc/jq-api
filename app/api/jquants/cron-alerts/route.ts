@@ -16,18 +16,38 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "SLACK_WEBHOOK_URL missing" }, { status: 500 });
   }
 
-  const baseUrl = process.env.VERCEL_URL
-    ? `https://${process.env.VERCEL_URL}`
-    : "http://localhost:3000";
+  // ★ ここが重要：baseUrlの作り方を安定化
+  const baseUrl =
+    process.env.VERCEL_PROJECT_PRODUCTION_URL
+      ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
+      : process.env.VERCEL_URL
+        ? `https://${process.env.VERCEL_URL}`
+        : "https://jq-api.vercel.app"; // 最後の保険（あなたの本番URL）
 
-  // 既存API（pullback）を呼ぶ
   const url = `${baseUrl}/api/jquants/pullback?tickers=${encodeURIComponent(tickers)}&only=buy`;
-  const res = await fetch(url, { cache: "no-store" });
-  const json = await res.json();
 
+  const res = await fetch(url, { cache: "no-store" });
+  const text = await res.text();
+
+  // JSONでなければ、そのまま返す（原因切り分け）
+  const contentType = res.headers.get("content-type") || "";
+  if (!res.ok) {
+    return NextResponse.json(
+      { error: "pullback fetch failed", status: res.status, url, contentType, bodyHead: text.slice(0, 200) },
+      { status: 500 }
+    );
+  }
+
+  if (!contentType.includes("application/json")) {
+    return NextResponse.json(
+      { error: "pullback returned non-json", url, contentType, bodyHead: text.slice(0, 200) },
+      { status: 500 }
+    );
+  }
+
+  const json = JSON.parse(text);
   const buys = (json.results || []).filter((x: any) => x.signal === "BUY");
 
-  // BUYがなければ何もしない（静かな運用）
   if (buys.length === 0) {
     return NextResponse.json({ ok: true, sent: false, count: 0 });
   }
@@ -55,5 +75,5 @@ ${url}
     body: JSON.stringify(payload),
   });
 
-  return NextResponse.json({ ok: true, sent: true, count: buys.length });
+  return NextResponse.json({ ok: true, sent: true, count: buys.length, url });
 }
