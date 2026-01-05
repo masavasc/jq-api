@@ -1,0 +1,12 @@
+{
+  "crons": [
+    {
+      "path": "/api/jquants/cron-alerts?secret=JQ_CRON_2026_x7Kp9Qm3Vt8A1z",
+      "schedule": "10 7 * * 2,5"
+    },
+    {
+      "path": "/api/macro/rate-diff-alerts?secret=JQ_CRON_2026_x7Kp9Qm3Vt8A1z",
+      "schedule": "0 9 * * 1-5"
+    }
+  ]
+}
