@@ -2,16 +2,79 @@ import { NextRequest, NextResponse } from "next/server";
 
 type FredObs = { date: string; value: string };
 
-// FREDから直近n件（有効値のみ）を新しい順で取る
-async function fredLatestN(seriesId: string, apiKey: string, need: number) {
-  // 欠損値が混ざるので多めに取る（直近180日）
+type Point = { date: string; value: number };
+
+const FRED_US10Y = "DGS10"; // US 10Y Treasury (daily)
+const MOF_JP10Y_URL = "https://www.mof.go.jp/jgbs/reference/interest_rate/jgbcm.csv";
+
+// ----------- Utilities -----------
+
+function parseDateToISO(s: string): string | null {
+  const t = s.trim();
+  if (!t) return null;
+
+  // YYYY-MM-DD
+  const m1 = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m1) {
+    const y = m1[1], mo = m1[2].padStart(2, "0"), d = m1[3].padStart(2, "0");
+    return `${y}-${mo}-${d}`;
+  }
+
+  // YYYY/MM/DD
+  const m2 = t.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
+  if (m2) {
+    const y = m2[1], mo = m2[2].padStart(2, "0"), d = m2[3].padStart(2, "0");
+    return `${y}-${mo}-${d}`;
+  }
+
+  // YYYY.MM.DD
+  const m3 = t.match(/^(\d{4})\.(\d{1,2})\.(\d{1,2})$/);
+  if (m3) {
+    const y = m3[1], mo = m3[2].padStart(2, "0"), d = m3[3].padStart(2, "0");
+    return `${y}-${mo}-${d}`;
+  }
+
+  return null;
+}
+
+function safeNumber(s: string): number | null {
+  const v = Number(String(s).trim());
+  return Number.isFinite(v) ? v : null;
+}
+
+// valuesNewestFirst: [v0(latest), v1, ... v5(5-days-ago)]
+function calcTrend5(valuesNewestFirst: number[]) {
+  if (valuesNewestFirst.length < 6) {
+    throw new Error(`Need at least 6 points to compute 5D trend, got ${valuesNewestFirst.length}`);
+  }
+
+  const latest = valuesNewestFirst[0];
+  const prev5 = valuesNewestFirst[5];
+  const delta5 = latest - prev5;
+  const avgDaily = delta5 / 5;
+
+  // consecutive shrinking: v0 < v1 < v2 < v3 < v4 < v5
+  const isShrinking = valuesNewestFirst.every((v, i, arr) => i === 0 || arr[i - 1] < v);
+  // consecutive widening: v0 > v1 > v2 > v3 > v4 > v5
+  const isWidening = valuesNewestFirst.every((v, i, arr) => i === 0 || arr[i - 1] > v);
+
+  const consecutive: "shrinking" | "widening" | "mixed" =
+    isShrinking ? "shrinking" : isWidening ? "widening" : "mixed";
+
+  return { latest, prev5, delta5, avgDaily, consecutive };
+}
+
+// ----------- FRED (US) -----------
+
+async function fredLatestN(seriesId: string, apiKey: string, need: number): Promise<Point[]> {
+  // Get plenty to survive missing days/holidays
   const url =
     `https://api.stlouisfed.org/fred/series/observations` +
     `?series_id=${encodeURIComponent(seriesId)}` +
     `&api_key=${encodeURIComponent(apiKey)}` +
     `&file_type=json` +
     `&sort_order=desc` +
-    `&limit=180`;
+    `&limit=120`;
 
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) {
@@ -21,10 +84,10 @@ async function fredLatestN(seriesId: string, apiKey: string, need: number) {
   const json = await res.json();
   const obs: FredObs[] = json.observations || [];
 
-  const out: { date: string; value: number }[] = [];
+  const out: Point[] = [];
   for (const o of obs) {
-    const v = Number(o.value);
-    if (Number.isFinite(v)) {
+    const v = safeNumber(o.value);
+    if (v !== null) {
       out.push({ date: o.date, value: v });
       if (out.length >= need) break;
     }
@@ -35,33 +98,126 @@ async function fredLatestN(seriesId: string, apiKey: string, need: number) {
   return out; // newest -> older
 }
 
-// 直近6点（= 5日差分・5日連続判定に必要）からトレンドを計算
-function trend5(valuesNewestFirst: number[]) {
-  // valuesNewestFirst.length >= 6 を想定（最新, 1日前, ... 5日前）
-  const latest = valuesNewestFirst[0];
-  const prev5 = valuesNewestFirst[5];
-  const delta5 = latest - prev5; // 5営業日差分（スプレッドの変化量）
+// ----------- MOF (JP) -----------
 
-  // 5日連続の方向性（単調性）
-  // 連続縮小：v0 < v1 < v2 < v3 < v4 < v5（新→旧で小さいほど縮小）
-  // 連続拡大：v0 > v1 > v2 > v3 > v4 > v5
-  let consecutive = "mixed" as "shrinking" | "widening" | "mixed";
-  const shrinking = valuesNewestFirst.every((v, i, arr) => i === 0 || v < arr[i - 1]); // v0 < v(-1) は常にfalse、なので逆
-  // ↑これだと判定が逆になるので、正しくは「最新が一番小さい」方向で比較する必要がある
-  // valuesNewestFirst: [v0(最新), v1, v2, v3, v4, v5(5日前)]
-  // 連続縮小（毎日縮んでいる）＝ v0 < v1 < v2 < v3 < v4 < v5
-  const isShrinking = valuesNewestFirst.every((v, i, arr) => i === 0 || arr[i - 1] < v);
-  // 連続拡大（毎日広がっている）＝ v0 > v1 > v2 > v3 > v4 > v5
-  const isWidening = valuesNewestFirst.every((v, i, arr) => i === 0 || arr[i - 1] > v);
-
-  if (isShrinking) consecutive = "shrinking";
-  else if (isWidening) consecutive = "widening";
-
-  // 5日平均変化（目安）
-  const avgDaily = delta5 / 5;
-
-  return { latest, prev5, delta5, avgDaily, consecutive };
+function decodeCsv(buf: ArrayBuffer): string {
+  // Try Shift-JIS first (MOF CSV is often SJIS), fallback to UTF-8
+  try {
+    // @ts-ignore
+    return new TextDecoder("shift_jis").decode(buf);
+  } catch {
+    return new TextDecoder("utf-8").decode(buf);
+  }
 }
+
+function splitCsvLine(line: string): string[] {
+  // Simple CSV splitter (MOF is plain CSV; no quoted commas in headers/values typically)
+  // If you ever see quoted commas, we can upgrade to a full CSV parser.
+  return line.split(",").map((s) => s.trim());
+}
+
+function findColIndex(headers: string[], patterns: RegExp[]): number {
+  for (const re of patterns) {
+    const idx = headers.findIndex((h) => re.test(h));
+    if (idx >= 0) return idx;
+  }
+  return -1;
+}
+
+async function mofLatestN_JP10Y(need: number): Promise<Point[]> {
+  const res = await fetch(MOF_JP10Y_URL, { cache: "no-store" });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`MOF CSV fetch failed: ${res.status} ${t.slice(0, 200)}`);
+  }
+  const buf = await res.arrayBuffer();
+  const text = decodeCsv(buf);
+
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  if (lines.length < 2) throw new Error("MOF CSV has too few lines");
+
+  const headers = splitCsvLine(lines[0]);
+
+  // Date column candidates
+  const dateIdx = findColIndex(headers, [/^date$/i, /日付/, /年月日/, /年\/月\/日/, /date/i]);
+  if (dateIdx < 0) throw new Error(`MOF CSV: date column not found. headers=${headers.join("|")}`);
+
+  // 10Y column candidates (try common representations)
+  const tenIdx = findColIndex(headers, [
+    /^10$/i,
+    /10\s*年/,
+    /10\s*year/i,
+    /10y/i,
+    /10\-year/i,
+    /10year/i,
+  ]);
+  if (tenIdx < 0) {
+    // Sometimes MOF uses "10" but with spaces or fullwidth; try a last-resort scan for "10"
+    const fallback = headers.findIndex((h) => /10/.test(h));
+    if (fallback < 0) throw new Error(`MOF CSV: 10Y column not found. headers=${headers.join("|")}`);
+    // else accept fallback
+  }
+
+  const jp10Idx = tenIdx >= 0 ? tenIdx : headers.findIndex((h) => /10/.test(h));
+
+  const points: Point[] = [];
+
+  // MOF CSV is usually oldest -> newest. We'll read from bottom to top to get latest quickly.
+  for (let i = lines.length - 1; i >= 1; i--) {
+    const cols = splitCsvLine(lines[i]);
+    if (cols.length <= Math.max(dateIdx, jp10Idx)) continue;
+
+    const iso = parseDateToISO(cols[dateIdx]);
+    if (!iso) continue;
+
+    const v = safeNumber(cols[jp10Idx]);
+    if (v === null) continue;
+
+    points.push({ date: iso, value: v });
+    if (points.length >= need) break;
+  }
+
+  if (points.length < need) {
+    throw new Error(`MOF CSV: not enough valid JP10Y points (need ${need}, got ${points.length})`);
+  }
+
+  // points currently newest -> older
+  return points;
+}
+
+// ----------- Alignment (by common dates) -----------
+
+function alignByDate(us: Point[], jp: Point[], need: number) {
+  const usMap = new Map(us.map((p) => [p.date, p.value]));
+  const jpMap = new Map(jp.map((p) => [p.date, p.value]));
+
+  // common dates (newest first)
+  const common = us
+    .map((p) => p.date)
+    .filter((d) => jpMap.has(d))
+    .slice(0, 60); // just in case
+
+  const aligned: { date: string; us: number; jp: number; spread: number }[] = [];
+  for (const d of common) {
+    const u = usMap.get(d);
+    const j = jpMap.get(d);
+    if (u === undefined || j === undefined) continue;
+    aligned.push({ date: d, us: u, jp: j, spread: u - j });
+    if (aligned.length >= need) break;
+  }
+
+  if (aligned.length < need) {
+    throw new Error(`Not enough common dates to align (need ${need}, got ${aligned.length}).`);
+  }
+
+  return aligned; // newest -> older
+}
+
+// ----------- API -----------
 
 export async function GET(_req: NextRequest) {
   try {
@@ -70,59 +226,68 @@ export async function GET(_req: NextRequest) {
       return NextResponse.json({ error: "FRED_API_KEY missing" }, { status: 500 });
     }
 
-    // series（安定運用：10年）
-    const US_ID = "DGS10";
-    const JP_ID = "IRLTLT01JPM156N";
+    // We need 6 points (latest + 5 business days ago) AFTER alignment.
+    // Fetch a bit more to ensure overlap.
+    const usRaw = await fredLatestN(FRED_US10Y, apiKey, 30);     // newest -> older
+    const jpRaw = await mofLatestN_JP10Y(30);                   // newest -> older
 
-    // 直近6点（= 5日トレンド計算に必要）
-    const us6 = await fredLatestN(US_ID, apiKey, 6);
-    const jp6 = await fredLatestN(JP_ID, apiKey, 6);
+    const aligned6 = alignByDate(usRaw, jpRaw, 6);              // newest -> older
 
-    // スプレッド（同じ“日付”で揃わない可能性があるので、日付はそれぞれ保持しつつ値で計算）
-    // ※FREDは営業日欠けや更新タイミング差があるため、厳密な日付アラインは別実装が必要。
-    // まずは「直近同士の6点」でトレンドを見る（実務ではこれで十分なことが多い）。
-    const spread6 = us6.map((u, i) => u.value - jp6[i].value); // newest -> older
+    const spread6 = aligned6.map((x) => x.spread);              // newest -> older
+    const us6 = aligned6.map((x) => x.us);
+    const jp6 = aligned6.map((x) => x.jp);
 
-    const tSpread = trend5(spread6);
-    const tUs = trend5(us6.map(x => x.value));
-    const tJp = trend5(jp6.map(x => x.value));
+    const tSpread = calcTrend5(spread6);
+    const tUs = calcTrend5(us6);
+    const tJp = calcTrend5(jp6);
+
+    const latest = aligned6[0];
 
     return NextResponse.json({
       ok: true,
       series: {
-        us10y: { id: US_ID, date: us6[0].date, value: us6[0].value, last6: us6 },
-        jp10y: { id: JP_ID, date: jp6[0].date, value: jp6[0].value, last6: jp6 },
+        us10y: {
+          id: FRED_US10Y,
+          source: "FRED",
+          date: latest.date,
+          value: latest.us,
+          last6: aligned6.map((x) => ({ date: x.date, value: x.us })),
+        },
+        jp10y: {
+          id: "MOF_JP10Y",
+          source: "MOF",
+          date: latest.date,
+          value: latest.jp,
+          last6: aligned6.map((x) => ({ date: x.date, value: x.jp })),
+        },
       },
       spread10y: {
-        // 最新値
-        date: us6[0].date, // 便宜上US側の日付（両者がズレる場合がある点は注意）
+        date: latest.date,
         value: tSpread.latest,
         unit: "pct_points",
-        last6: spread6.map((v, i) => ({
-          // 参考：各点の“組み合わせ日付”としてUS側日付を置く（より厳密にするなら日付アライン実装）
-          date: us6[i].date,
-          value: v,
-        })),
+        last6: aligned6.map((x) => ({ date: x.date, value: x.spread })),
       },
       trend5d: {
-        // スプレッド（=日米金利差）の5日トレンド
         spread: {
-          delta5: tSpread.delta5,          // 最新 - 5日前（%pt）
-          avgDaily: tSpread.avgDaily,      // 1日あたり平均
-          consecutive: tSpread.consecutive // shrinking / widening / mixed
+          delta5: tSpread.delta5,
+          avgDaily: tSpread.avgDaily,
+          consecutive: tSpread.consecutive,
         },
-        // 参考：内訳（US / JP の5日変化）
         us10y: {
           delta5: tUs.delta5,
           avgDaily: tUs.avgDaily,
-          consecutive: tUs.consecutive
+          consecutive: tUs.consecutive,
         },
         jp10y: {
           delta5: tJp.delta5,
           avgDaily: tJp.avgDaily,
-          consecutive: tJp.consecutive
-        }
-      }
+          consecutive: tJp.consecutive,
+        },
+      },
+      notes: {
+        jp_source: "MOF jgbcm.csv (daily, business days)",
+        alignment: "US & JP aligned by common dates before computing 5-day trend",
+      },
     });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "error" }, { status: 500 });
