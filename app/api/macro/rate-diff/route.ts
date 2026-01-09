@@ -3,11 +3,11 @@ import { NextRequest, NextResponse } from "next/server";
 type FredObs = { date: string; value: string };
 type Point = { date: string; value: number };
 
+const VERSION = "mof-header-skip-v4";
 const FRED_US10Y = "DGS10";
 const MOF_JGBCM_CSV = "https://www.mof.go.jp/jgbs/reference/interest_rate/jgbcm.csv";
 
-// ---------------- Utilities ----------------
-
+// ---------- utils ----------
 function safeNumber(s: string): number | null {
   const v = Number(String(s).trim());
   return Number.isFinite(v) ? v : null;
@@ -17,15 +17,12 @@ function parseDateToISO(s: string): string | null {
   const t = String(s).trim();
   if (!t) return null;
 
-  // YYYY-MM-DD
   let m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
   if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
 
-  // YYYY/MM/DD
   m = t.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
   if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
 
-  // YYYY.MM.DD
   m = t.match(/^(\d{4})\.(\d{1,2})\.(\d{1,2})$/);
   if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
 
@@ -33,7 +30,6 @@ function parseDateToISO(s: string): string | null {
 }
 
 function decodeCsv(buf: ArrayBuffer): string {
-  // MOF CSV is often Shift-JIS; try it first, then UTF-8.
   try {
     // @ts-ignore
     return new TextDecoder("shift_jis").decode(buf);
@@ -42,59 +38,144 @@ function decodeCsv(buf: ArrayBuffer): string {
   }
 }
 
-// MOF CSV is simple; usually no quoted commas.
-// We keep it simple but robust for extra spaces.
-function splitCsvLine(line: string): string[] {
-  return line.split(",").map((s) => s.trim());
+// カンマ/全角カンマ/タブの揺れを吸収
+function splitRow(line: string): string[] {
+  // BOM除去
+  let s = line.replace(/^\uFEFF/, "").trim();
+  // 全角カンマを半角へ
+  s = s.replace(/，/g, ",");
+  // まずカンマで割る
+  let cols = s.split(",").map((x) => x.trim());
+  // もしほぼ1列ならタブ区切りの可能性
+  if (cols.length <= 1) cols = s.split("\t").map((x) => x.trim());
+  return cols;
 }
 
 function normalizeHeader(s: string): string {
-  // Remove spaces (incl. full-width), unify
   return s
     .replace(/\u3000/g, " ")
     .replace(/\s+/g, "")
     .toLowerCase();
 }
 
-function findHeaderRow(lines: string[]): { headerIndex: number; headers: string[] } {
-  // Find the first row that contains "日付" (date) and looks like a CSV header row.
-  for (let i = 0; i < Math.min(lines.length, 40); i++) {
-    const cols = splitCsvLine(lines[i]);
-    if (cols.length < 5) continue;
+function isLikelyMetaLine(line: string): boolean {
+  return (
+    /国債金利情報/.test(line) ||
+    /単位/.test(line) ||
+    /（単位/.test(line) ||
+    /月/.test(line) && /令和/.test(line) ||
+    /^#/.test(line)
+  );
+}
 
-    const norm = cols.map(normalizeHeader);
-    const hasDate = norm.some((h) => h === "日付" || h.includes("日付") || h === "date");
-    // Also check there are term-like columns e.g. "10年" or "1年"
-    const hasTerm = norm.some((h) => h.includes("10年") || h === "10" || h.includes("1年") || h.includes("2年"));
-    if (hasDate && hasTerm) {
-      return { headerIndex: i, headers: cols };
+function hasTenYear(cols: string[]): boolean {
+  const norm = cols.map(normalizeHeader);
+  return norm.some((h) => h === "10年" || h === "10" || h.includes("10年") || h.includes("10y") || h.includes("10year"));
+}
+
+function findDateCol(cols: string[]): number {
+  const norm = cols.map(normalizeHeader);
+  // 日付の呼び方揺れに対応
+  const idx = norm.findIndex((h) =>
+    h === "日付" ||
+    h.includes("日付") ||
+    h === "date" ||
+    h.includes("年月日") ||
+    h.includes("年月")
+  );
+  return idx;
+}
+
+function find10yCol(headers: string[]): number {
+  const norm = headers.map(normalizeHeader);
+  // 強めの候補
+  const idx =
+    norm.findIndex((h) => h === "10年") >= 0 ? norm.findIndex((h) => h === "10年") :
+    norm.findIndex((h) => h === "10") >= 0 ? norm.findIndex((h) => h === "10") :
+    norm.findIndex((h) => h.includes("10年")) >= 0 ? norm.findIndex((h) => h.includes("10年")) :
+    norm.findIndex((h) => h.includes("10y")) >= 0 ? norm.findIndex((h) => h.includes("10y")) :
+    norm.findIndex((h) => h.includes("10year")) >= 0 ? norm.findIndex((h) => h.includes("10year")) :
+    -1;
+  return idx;
+}
+
+// ヘッダー検出：
+// 1) 「日付」+「10年」を含む行を探す（最優先）
+// 2) 「10年」を含む行の“次行”が日付データなら、その行をヘッダーとみなす（2段構造対応）
+// 3) それもなければ「最初のデータ行（先頭列が日付）」の直前行をヘッダー候補にする
+function detectHeader(lines: string[]) {
+  const maxScan = Math.min(lines.length, 200);
+
+  // (1) 直球のヘッダー
+  for (let i = 0; i < maxScan; i++) {
+    const raw = lines[i];
+    if (isLikelyMetaLine(raw)) continue;
+
+    const cols = splitRow(raw);
+    if (cols.length < 6) continue;
+
+    const dateIdx = findDateCol(cols);
+    const tenOk = hasTenYear(cols);
+
+    if (dateIdx >= 0 && tenOk) {
+      return { headerIndex: i, headers: cols, dateIdx, tenIdx: find10yCol(cols) };
     }
   }
-  throw new Error(`MOF CSV: header row not found (searched first 40 lines).`);
-}
 
-function findColumnIndex(headers: string[], candidates: RegExp[]): number {
-  const norm = headers.map(normalizeHeader);
-  for (const re of candidates) {
-    const idx = norm.findIndex((h) => re.test(h));
-    if (idx >= 0) return idx;
+  // (2) 2段構造（上段に年限、次行からデータ）
+  for (let i = 0; i < maxScan - 1; i++) {
+    const raw = lines[i];
+    if (isLikelyMetaLine(raw)) continue;
+
+    const cols = splitRow(raw);
+    if (cols.length < 6) continue;
+
+    if (!hasTenYear(cols)) continue;
+
+    const next = splitRow(lines[i + 1]);
+    if (next.length >= 2) {
+      const d = parseDateToISO(next[0]) ?? parseDateToISO(next[findDateCol(next)] ?? "");
+      if (d) {
+        // ヘッダー行に日付名が無くても、日付列は先頭と仮定
+        const tenIdx = find10yCol(cols);
+        if (tenIdx >= 0) return { headerIndex: i, headers: cols, dateIdx: 0, tenIdx };
+      }
+    }
   }
-  return -1;
+
+  // (3) データ行の直前をヘッダー候補にする
+  for (let i = 1; i < maxScan; i++) {
+    const cols = splitRow(lines[i]);
+    if (cols.length < 6) continue;
+
+    const d0 = parseDateToISO(cols[0]);
+    if (!d0) continue;
+
+    // ある程度数値が入っている（データ行らしい）ことを確認
+    const numericCount = cols.slice(1, Math.min(cols.length, 10)).map(safeNumber).filter(v => v !== null).length;
+    if (numericCount >= 3) {
+      // 直前行をヘッダーとみなす
+      const hdr = splitRow(lines[i - 1]);
+      const tenIdx = find10yCol(hdr);
+      if (hdr.length >= 6 && tenIdx >= 0) {
+        return { headerIndex: i - 1, headers: hdr, dateIdx: 0, tenIdx };
+      }
+    }
+  }
+
+  // デバッグ情報（先頭数行を返す）
+  const head = lines.slice(0, Math.min(20, lines.length)).join("\\n");
+  throw new Error(`MOF CSV: header row not found. version=${VERSION}. head20=${head.slice(0, 800)}`);
 }
 
-// 5D trend from valuesNewestFirst: [v0(latest), v1, ... v5(5days-ago)]
 function calcTrend5(valuesNewestFirst: number[]) {
-  if (valuesNewestFirst.length < 6) {
-    throw new Error(`Need at least 6 points for 5D trend, got ${valuesNewestFirst.length}`);
-  }
+  if (valuesNewestFirst.length < 6) throw new Error(`Need at least 6 points for 5D trend, got ${valuesNewestFirst.length}`);
   const latest = valuesNewestFirst[0];
   const prev5 = valuesNewestFirst[5];
   const delta5 = latest - prev5;
   const avgDaily = delta5 / 5;
 
-  // shrinking: v0 < v1 < v2 < v3 < v4 < v5 (latest smallest)
   const isShrinking = valuesNewestFirst.every((v, i, arr) => i === 0 || arr[i - 1] < v);
-  // widening: v0 > v1 > v2 > v3 > v4 > v5
   const isWidening = valuesNewestFirst.every((v, i, arr) => i === 0 || arr[i - 1] > v);
 
   const consecutive: "shrinking" | "widening" | "mixed" =
@@ -103,8 +184,7 @@ function calcTrend5(valuesNewestFirst: number[]) {
   return { latest, prev5, delta5, avgDaily, consecutive };
 }
 
-// ---------------- FRED US10Y ----------------
-
+// ---------- FRED ----------
 async function fredLatestN(seriesId: string, apiKey: string, need: number): Promise<Point[]> {
   const url =
     `https://api.stlouisfed.org/fred/series/observations` +
@@ -130,14 +210,11 @@ async function fredLatestN(seriesId: string, apiKey: string, need: number): Prom
       if (out.length >= need) break;
     }
   }
-  if (out.length < need) {
-    throw new Error(`Not enough valid observations for ${seriesId} (need ${need}, got ${out.length})`);
-  }
+  if (out.length < need) throw new Error(`Not enough valid observations for ${seriesId} (need ${need}, got ${out.length})`);
   return out; // newest -> older
 }
 
-// ---------------- MOF JP10Y ----------------
-
+// ---------- MOF ----------
 async function mofLatestN_JP10Y(need: number): Promise<Point[]> {
   const res = await fetch(MOF_JGBCM_CSV, { cache: "no-store" });
   if (!res.ok) {
@@ -151,33 +228,14 @@ async function mofLatestN_JP10Y(need: number): Promise<Point[]> {
   const rawLines = csvText.split(/\r?\n/);
   const lines = rawLines.map((l) => l.trim()).filter((l) => l.length > 0);
 
-  if (lines.length < 3) {
-    throw new Error("MOF CSV: too few lines");
-  }
+  const { headerIndex, headers, dateIdx, tenIdx } = detectHeader(lines);
+  if (tenIdx < 0) throw new Error(`MOF CSV: 10Y column not found. version=${VERSION}. headers=${headers.join("|")}`);
 
-  // Detect header row (skip title/units lines)
-  const { headerIndex, headers } = findHeaderRow(lines);
-
-  // Find date column
-  const dateIdx = findColumnIndex(headers, [/^(日付|date)$/i, /日付/]);
-  if (dateIdx < 0) {
-    throw new Error(`MOF CSV: date column not found. headers=${headers.join("|")}`);
-  }
-
-  // Find 10Y column (robust patterns)
-  // normalized header examples: "10年", "10", "10year"
-  const tenIdx = findColumnIndex(headers, [/^10年$/i, /^10$/i, /^10y$/i, /^10year$/i, /10年/]);
-  if (tenIdx < 0) {
-    throw new Error(`MOF CSV: 10Y column not found. headers=${headers.join("|")}`);
-  }
-
-  // Data lines start after header row
   const dataLines = lines.slice(headerIndex + 1);
 
-  // Read from bottom to top (latest first)
   const out: Point[] = [];
   for (let i = dataLines.length - 1; i >= 0; i--) {
-    const cols = splitCsvLine(dataLines[i]);
+    const cols = splitRow(dataLines[i]);
     if (cols.length <= Math.max(dateIdx, tenIdx)) continue;
 
     const iso = parseDateToISO(cols[dateIdx]);
@@ -191,21 +249,18 @@ async function mofLatestN_JP10Y(need: number): Promise<Point[]> {
   }
 
   if (out.length < need) {
-    throw new Error(`MOF CSV: not enough valid JP10Y points (need ${need}, got ${out.length})`);
+    throw new Error(`MOF CSV: not enough valid JP10Y points (need ${need}, got ${out.length}). version=${VERSION}`);
   }
 
   return out; // newest -> older
 }
 
-// ---------------- Alignment ----------------
-
+// ---------- alignment ----------
 function alignByDate(us: Point[], jp: Point[], need: number) {
   const usMap = new Map(us.map((p) => [p.date, p.value]));
   const jpMap = new Map(jp.map((p) => [p.date, p.value]));
 
-  const commonDates = us
-    .map((p) => p.date)          // already newest -> older
-    .filter((d) => jpMap.has(d));
+  const commonDates = us.map((p) => p.date).filter((d) => jpMap.has(d));
 
   const aligned: { date: string; us: number; jp: number; spread: number }[] = [];
   for (const d of commonDates) {
@@ -217,25 +272,23 @@ function alignByDate(us: Point[], jp: Point[], need: number) {
   }
 
   if (aligned.length < need) {
-    throw new Error(`Not enough common dates to align (need ${need}, got ${aligned.length}).`);
+    throw new Error(`Not enough common dates to align (need ${need}, got ${aligned.length}). version=${VERSION}`);
   }
+
   return aligned; // newest -> older
 }
 
-// ---------------- API ----------------
-
+// ---------- API ----------
 export async function GET(_req: NextRequest) {
   try {
     const apiKey = process.env.FRED_API_KEY || "";
     if (!apiKey) {
-      return NextResponse.json({ error: "FRED_API_KEY missing" }, { status: 500 });
+      return NextResponse.json({ error: "FRED_API_KEY missing", version: VERSION }, { status: 500 });
     }
 
-    // Fetch more than we need to survive holidays & mismatched calendars
     const usRaw = await fredLatestN(FRED_US10Y, apiKey, 40);
     const jpRaw = await mofLatestN_JP10Y(40);
 
-    // Need 6 aligned points for 5-business-day trend
     const aligned6 = alignByDate(usRaw, jpRaw, 6);
 
     const spread6 = aligned6.map((x) => x.spread);
@@ -250,6 +303,7 @@ export async function GET(_req: NextRequest) {
 
     return NextResponse.json({
       ok: true,
+      version: VERSION,
       series: {
         us10y: {
           id: FRED_US10Y,
@@ -290,11 +344,11 @@ export async function GET(_req: NextRequest) {
         },
       },
       notes: {
-        jp_source: "MOF jgbcm.csv (daily). Header row auto-detected (skipping title/unit lines).",
-        alignment: "US & JP aligned by common dates before computing 5-business-day trend.",
+        jp_source: "MOF jgbcm.csv (daily). Header auto-detected with fallbacks.",
+        alignment: "US & JP aligned by common dates.",
       },
     });
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message ?? "error" }, { status: 500 });
+    return NextResponse.json({ error: e?.message ?? "error", version: VERSION }, { status: 500 });
   }
 }
