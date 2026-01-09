@@ -1,61 +1,100 @@
 import { NextRequest, NextResponse } from "next/server";
 
 type FredObs = { date: string; value: string };
-
 type Point = { date: string; value: number };
 
-const FRED_US10Y = "DGS10"; // US 10Y Treasury (daily)
-const MOF_JP10Y_URL = "https://www.mof.go.jp/jgbs/reference/interest_rate/jgbcm.csv";
+const FRED_US10Y = "DGS10";
+const MOF_JGBCM_CSV = "https://www.mof.go.jp/jgbs/reference/interest_rate/jgbcm.csv";
 
-// ----------- Utilities -----------
-
-function parseDateToISO(s: string): string | null {
-  const t = s.trim();
-  if (!t) return null;
-
-  // YYYY-MM-DD
-  const m1 = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
-  if (m1) {
-    const y = m1[1], mo = m1[2].padStart(2, "0"), d = m1[3].padStart(2, "0");
-    return `${y}-${mo}-${d}`;
-  }
-
-  // YYYY/MM/DD
-  const m2 = t.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
-  if (m2) {
-    const y = m2[1], mo = m2[2].padStart(2, "0"), d = m2[3].padStart(2, "0");
-    return `${y}-${mo}-${d}`;
-  }
-
-  // YYYY.MM.DD
-  const m3 = t.match(/^(\d{4})\.(\d{1,2})\.(\d{1,2})$/);
-  if (m3) {
-    const y = m3[1], mo = m3[2].padStart(2, "0"), d = m3[3].padStart(2, "0");
-    return `${y}-${mo}-${d}`;
-  }
-
-  return null;
-}
+// ---------------- Utilities ----------------
 
 function safeNumber(s: string): number | null {
   const v = Number(String(s).trim());
   return Number.isFinite(v) ? v : null;
 }
 
-// valuesNewestFirst: [v0(latest), v1, ... v5(5-days-ago)]
+function parseDateToISO(s: string): string | null {
+  const t = String(s).trim();
+  if (!t) return null;
+
+  // YYYY-MM-DD
+  let m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+
+  // YYYY/MM/DD
+  m = t.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
+  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+
+  // YYYY.MM.DD
+  m = t.match(/^(\d{4})\.(\d{1,2})\.(\d{1,2})$/);
+  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+
+  return null;
+}
+
+function decodeCsv(buf: ArrayBuffer): string {
+  // MOF CSV is often Shift-JIS; try it first, then UTF-8.
+  try {
+    // @ts-ignore
+    return new TextDecoder("shift_jis").decode(buf);
+  } catch {
+    return new TextDecoder("utf-8").decode(buf);
+  }
+}
+
+// MOF CSV is simple; usually no quoted commas.
+// We keep it simple but robust for extra spaces.
+function splitCsvLine(line: string): string[] {
+  return line.split(",").map((s) => s.trim());
+}
+
+function normalizeHeader(s: string): string {
+  // Remove spaces (incl. full-width), unify
+  return s
+    .replace(/\u3000/g, " ")
+    .replace(/\s+/g, "")
+    .toLowerCase();
+}
+
+function findHeaderRow(lines: string[]): { headerIndex: number; headers: string[] } {
+  // Find the first row that contains "日付" (date) and looks like a CSV header row.
+  for (let i = 0; i < Math.min(lines.length, 40); i++) {
+    const cols = splitCsvLine(lines[i]);
+    if (cols.length < 5) continue;
+
+    const norm = cols.map(normalizeHeader);
+    const hasDate = norm.some((h) => h === "日付" || h.includes("日付") || h === "date");
+    // Also check there are term-like columns e.g. "10年" or "1年"
+    const hasTerm = norm.some((h) => h.includes("10年") || h === "10" || h.includes("1年") || h.includes("2年"));
+    if (hasDate && hasTerm) {
+      return { headerIndex: i, headers: cols };
+    }
+  }
+  throw new Error(`MOF CSV: header row not found (searched first 40 lines).`);
+}
+
+function findColumnIndex(headers: string[], candidates: RegExp[]): number {
+  const norm = headers.map(normalizeHeader);
+  for (const re of candidates) {
+    const idx = norm.findIndex((h) => re.test(h));
+    if (idx >= 0) return idx;
+  }
+  return -1;
+}
+
+// 5D trend from valuesNewestFirst: [v0(latest), v1, ... v5(5days-ago)]
 function calcTrend5(valuesNewestFirst: number[]) {
   if (valuesNewestFirst.length < 6) {
-    throw new Error(`Need at least 6 points to compute 5D trend, got ${valuesNewestFirst.length}`);
+    throw new Error(`Need at least 6 points for 5D trend, got ${valuesNewestFirst.length}`);
   }
-
   const latest = valuesNewestFirst[0];
   const prev5 = valuesNewestFirst[5];
   const delta5 = latest - prev5;
   const avgDaily = delta5 / 5;
 
-  // consecutive shrinking: v0 < v1 < v2 < v3 < v4 < v5
+  // shrinking: v0 < v1 < v2 < v3 < v4 < v5 (latest smallest)
   const isShrinking = valuesNewestFirst.every((v, i, arr) => i === 0 || arr[i - 1] < v);
-  // consecutive widening: v0 > v1 > v2 > v3 > v4 > v5
+  // widening: v0 > v1 > v2 > v3 > v4 > v5
   const isWidening = valuesNewestFirst.every((v, i, arr) => i === 0 || arr[i - 1] > v);
 
   const consecutive: "shrinking" | "widening" | "mixed" =
@@ -64,10 +103,9 @@ function calcTrend5(valuesNewestFirst: number[]) {
   return { latest, prev5, delta5, avgDaily, consecutive };
 }
 
-// ----------- FRED (US) -----------
+// ---------------- FRED US10Y ----------------
 
 async function fredLatestN(seriesId: string, apiKey: string, need: number): Promise<Point[]> {
-  // Get plenty to survive missing days/holidays
   const url =
     `https://api.stlouisfed.org/fred/series/observations` +
     `?series_id=${encodeURIComponent(seriesId)}` +
@@ -98,111 +136,79 @@ async function fredLatestN(seriesId: string, apiKey: string, need: number): Prom
   return out; // newest -> older
 }
 
-// ----------- MOF (JP) -----------
-
-function decodeCsv(buf: ArrayBuffer): string {
-  // Try Shift-JIS first (MOF CSV is often SJIS), fallback to UTF-8
-  try {
-    // @ts-ignore
-    return new TextDecoder("shift_jis").decode(buf);
-  } catch {
-    return new TextDecoder("utf-8").decode(buf);
-  }
-}
-
-function splitCsvLine(line: string): string[] {
-  // Simple CSV splitter (MOF is plain CSV; no quoted commas in headers/values typically)
-  // If you ever see quoted commas, we can upgrade to a full CSV parser.
-  return line.split(",").map((s) => s.trim());
-}
-
-function findColIndex(headers: string[], patterns: RegExp[]): number {
-  for (const re of patterns) {
-    const idx = headers.findIndex((h) => re.test(h));
-    if (idx >= 0) return idx;
-  }
-  return -1;
-}
+// ---------------- MOF JP10Y ----------------
 
 async function mofLatestN_JP10Y(need: number): Promise<Point[]> {
-  const res = await fetch(MOF_JP10Y_URL, { cache: "no-store" });
+  const res = await fetch(MOF_JGBCM_CSV, { cache: "no-store" });
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     throw new Error(`MOF CSV fetch failed: ${res.status} ${t.slice(0, 200)}`);
   }
+
   const buf = await res.arrayBuffer();
-  const text = decodeCsv(buf);
+  const csvText = decodeCsv(buf);
 
-  const lines = text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
+  const rawLines = csvText.split(/\r?\n/);
+  const lines = rawLines.map((l) => l.trim()).filter((l) => l.length > 0);
 
-  if (lines.length < 2) throw new Error("MOF CSV has too few lines");
-
-  const headers = splitCsvLine(lines[0]);
-
-  // Date column candidates
-  const dateIdx = findColIndex(headers, [/^date$/i, /日付/, /年月日/, /年\/月\/日/, /date/i]);
-  if (dateIdx < 0) throw new Error(`MOF CSV: date column not found. headers=${headers.join("|")}`);
-
-  // 10Y column candidates (try common representations)
-  const tenIdx = findColIndex(headers, [
-    /^10$/i,
-    /10\s*年/,
-    /10\s*year/i,
-    /10y/i,
-    /10\-year/i,
-    /10year/i,
-  ]);
-  if (tenIdx < 0) {
-    // Sometimes MOF uses "10" but with spaces or fullwidth; try a last-resort scan for "10"
-    const fallback = headers.findIndex((h) => /10/.test(h));
-    if (fallback < 0) throw new Error(`MOF CSV: 10Y column not found. headers=${headers.join("|")}`);
-    // else accept fallback
+  if (lines.length < 3) {
+    throw new Error("MOF CSV: too few lines");
   }
 
-  const jp10Idx = tenIdx >= 0 ? tenIdx : headers.findIndex((h) => /10/.test(h));
+  // Detect header row (skip title/units lines)
+  const { headerIndex, headers } = findHeaderRow(lines);
 
-  const points: Point[] = [];
+  // Find date column
+  const dateIdx = findColumnIndex(headers, [/^(日付|date)$/i, /日付/]);
+  if (dateIdx < 0) {
+    throw new Error(`MOF CSV: date column not found. headers=${headers.join("|")}`);
+  }
 
-  // MOF CSV is usually oldest -> newest. We'll read from bottom to top to get latest quickly.
-  for (let i = lines.length - 1; i >= 1; i--) {
-    const cols = splitCsvLine(lines[i]);
-    if (cols.length <= Math.max(dateIdx, jp10Idx)) continue;
+  // Find 10Y column (robust patterns)
+  // normalized header examples: "10年", "10", "10year"
+  const tenIdx = findColumnIndex(headers, [/^10年$/i, /^10$/i, /^10y$/i, /^10year$/i, /10年/]);
+  if (tenIdx < 0) {
+    throw new Error(`MOF CSV: 10Y column not found. headers=${headers.join("|")}`);
+  }
+
+  // Data lines start after header row
+  const dataLines = lines.slice(headerIndex + 1);
+
+  // Read from bottom to top (latest first)
+  const out: Point[] = [];
+  for (let i = dataLines.length - 1; i >= 0; i--) {
+    const cols = splitCsvLine(dataLines[i]);
+    if (cols.length <= Math.max(dateIdx, tenIdx)) continue;
 
     const iso = parseDateToISO(cols[dateIdx]);
     if (!iso) continue;
 
-    const v = safeNumber(cols[jp10Idx]);
+    const v = safeNumber(cols[tenIdx]);
     if (v === null) continue;
 
-    points.push({ date: iso, value: v });
-    if (points.length >= need) break;
+    out.push({ date: iso, value: v });
+    if (out.length >= need) break;
   }
 
-  if (points.length < need) {
-    throw new Error(`MOF CSV: not enough valid JP10Y points (need ${need}, got ${points.length})`);
+  if (out.length < need) {
+    throw new Error(`MOF CSV: not enough valid JP10Y points (need ${need}, got ${out.length})`);
   }
 
-  // points currently newest -> older
-  return points;
+  return out; // newest -> older
 }
 
-// ----------- Alignment (by common dates) -----------
+// ---------------- Alignment ----------------
 
 function alignByDate(us: Point[], jp: Point[], need: number) {
   const usMap = new Map(us.map((p) => [p.date, p.value]));
   const jpMap = new Map(jp.map((p) => [p.date, p.value]));
 
-  // common dates (newest first)
-  const common = us
-    .map((p) => p.date)
-    .filter((d) => jpMap.has(d))
-    .slice(0, 60); // just in case
+  const commonDates = us
+    .map((p) => p.date)          // already newest -> older
+    .filter((d) => jpMap.has(d));
 
   const aligned: { date: string; us: number; jp: number; spread: number }[] = [];
-  for (const d of common) {
+  for (const d of commonDates) {
     const u = usMap.get(d);
     const j = jpMap.get(d);
     if (u === undefined || j === undefined) continue;
@@ -213,11 +219,10 @@ function alignByDate(us: Point[], jp: Point[], need: number) {
   if (aligned.length < need) {
     throw new Error(`Not enough common dates to align (need ${need}, got ${aligned.length}).`);
   }
-
   return aligned; // newest -> older
 }
 
-// ----------- API -----------
+// ---------------- API ----------------
 
 export async function GET(_req: NextRequest) {
   try {
@@ -226,14 +231,14 @@ export async function GET(_req: NextRequest) {
       return NextResponse.json({ error: "FRED_API_KEY missing" }, { status: 500 });
     }
 
-    // We need 6 points (latest + 5 business days ago) AFTER alignment.
-    // Fetch a bit more to ensure overlap.
-    const usRaw = await fredLatestN(FRED_US10Y, apiKey, 30);     // newest -> older
-    const jpRaw = await mofLatestN_JP10Y(30);                   // newest -> older
+    // Fetch more than we need to survive holidays & mismatched calendars
+    const usRaw = await fredLatestN(FRED_US10Y, apiKey, 40);
+    const jpRaw = await mofLatestN_JP10Y(40);
 
-    const aligned6 = alignByDate(usRaw, jpRaw, 6);              // newest -> older
+    // Need 6 aligned points for 5-business-day trend
+    const aligned6 = alignByDate(usRaw, jpRaw, 6);
 
-    const spread6 = aligned6.map((x) => x.spread);              // newest -> older
+    const spread6 = aligned6.map((x) => x.spread);
     const us6 = aligned6.map((x) => x.us);
     const jp6 = aligned6.map((x) => x.jp);
 
@@ -285,8 +290,8 @@ export async function GET(_req: NextRequest) {
         },
       },
       notes: {
-        jp_source: "MOF jgbcm.csv (daily, business days)",
-        alignment: "US & JP aligned by common dates before computing 5-day trend",
+        jp_source: "MOF jgbcm.csv (daily). Header row auto-detected (skipping title/unit lines).",
+        alignment: "US & JP aligned by common dates before computing 5-business-day trend.",
       },
     });
   } catch (e: any) {
