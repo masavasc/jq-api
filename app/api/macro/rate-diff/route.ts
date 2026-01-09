@@ -3,24 +3,20 @@ import { NextRequest, NextResponse } from "next/server";
 type FredObs = { date: string; value: string };
 type Point = { date: string; value: number };
 
-const VERSION = "mof-pattern-fixedcol-v1";
+const VERSION = "boj-primary-mof-fallback-v1";
 
-// US: FRED daily
-const FRED_US10Y = "DGS10";
+const FRED_US10Y = "DGS10"; // US 10Y (daily, FRED)
 
-// JP: MOF CSV (human-oriented; title/notes/header may vary)
-const MOF_JGBCM_CSV = "https://www.mof.go.jp/jgbs/reference/interest_rate/jgbcm.csv";
+// BOJ direct link (set in env). If missing/unusable -> fallback to MOF historical daily.
+const MOF_ALL_DAILY = "https://www.mof.go.jp/jgbs/reference/interest_rate/data/jgbcm_all.csv";
 
-// MOF “fixed column” rule:
-// Col0 = date-like (e.g., 2026/01/06), Col1=1Y, Col2=2Y, ... Col10=10Y
-const MOF_TENOR_10Y_INDEX = 10;
-
-// ---------------- Utilities ----------------
-
+// ---------- utils ----------
 function safeNumber(s: string): number | null {
   const v = Number(String(s).trim());
   return Number.isFinite(v) ? v : null;
 }
+
+function pad2(n: string) { return n.padStart(2, "0"); }
 
 function parseDateToISO(s: string): string | null {
   const t = String(s).trim();
@@ -28,30 +24,44 @@ function parseDateToISO(s: string): string | null {
 
   // YYYY-MM-DD
   let m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
-  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+  if (m) return `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`;
 
   // YYYY/MM/DD
   m = t.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
-  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+  if (m) return `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`;
 
   // YYYY.MM.DD
   m = t.match(/^(\d{4})\.(\d{1,2})\.(\d{1,2})$/);
-  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+  if (m) return `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`;
 
   return null;
 }
 
-function decodeCsv(buf: ArrayBuffer): string {
-  // MOF is often Shift-JIS; fall back to UTF-8
-  try {
-    // @ts-ignore
-    return new TextDecoder("shift_jis").decode(buf);
-  } catch {
-    return new TextDecoder("utf-8").decode(buf);
-  }
+// MOF historical "基準日" often like S49.9.24 / H1.5.7 / R8.1.6 etc.
+function parseJapaneseEraDateToISO(s: string): string | null {
+  const t = String(s).trim();
+  if (!t) return null;
+
+  // Era + yy.mm.dd  (S,H,R)
+  const m = t.match(/^([SHR])\s*([0-9]{1,2})\.\s*([0-9]{1,2})\.\s*([0-9]{1,2})$/i);
+  if (!m) return null;
+
+  const era = m[1].toUpperCase();
+  const yy = Number(m[2]);
+  const mm = Number(m[3]);
+  const dd = Number(m[4]);
+
+  if (!(yy >= 1 && mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31)) return null;
+
+  let year = 0;
+  if (era === "S") year = 1925 + yy; // Showa 1=1926
+  if (era === "H") year = 1988 + yy; // Heisei 1=1989
+  if (era === "R") year = 2018 + yy; // Reiwa 1=2019
+
+  return `${year}-${String(mm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
 }
 
-// delimiter wobble: comma / fullwidth comma / tab
+// delimiter wobble
 function splitRow(line: string): string[] {
   let s = line.replace(/^\uFEFF/, "").trim();
   s = s.replace(/，/g, ",");
@@ -70,9 +80,7 @@ function calcTrend5(valuesNewestFirst: number[]) {
   const delta5 = latest - prev5;
   const avgDaily = delta5 / 5;
 
-  // shrinking: v0 < v1 < v2 < v3 < v4 < v5
   const isShrinking = valuesNewestFirst.every((v, i, arr) => i === 0 || arr[i - 1] < v);
-  // widening: v0 > v1 > v2 > v3 > v4 > v5
   const isWidening = valuesNewestFirst.every((v, i, arr) => i === 0 || arr[i - 1] > v);
 
   const consecutive: "shrinking" | "widening" | "mixed" =
@@ -81,8 +89,26 @@ function calcTrend5(valuesNewestFirst: number[]) {
   return { latest, prev5, delta5, avgDaily, consecutive };
 }
 
-// ---------------- FRED (US10Y) ----------------
+function alignByDate(us: Point[], jp: Point[], need: number) {
+  const usMap = new Map(us.map((p) => [p.date, p.value]));
+  const jpMap = new Map(jp.map((p) => [p.date, p.value]));
+  const commonDates = us.map((p) => p.date).filter((d) => jpMap.has(d));
 
+  const aligned: { date: string; us: number; jp: number; spread: number }[] = [];
+  for (const d of commonDates) {
+    const u = usMap.get(d);
+    const j = jpMap.get(d);
+    if (u === undefined || j === undefined) continue;
+    aligned.push({ date: d, us: u, jp: j, spread: u - j });
+    if (aligned.length >= need) break;
+  }
+  if (aligned.length < need) {
+    throw new Error(`Not enough common dates to align (need ${need}, got ${aligned.length}).`);
+  }
+  return aligned; // newest -> older
+}
+
+// ---------- FRED US10Y ----------
 async function fredLatestN(seriesId: string, apiKey: string, need: number): Promise<Point[]> {
   const url =
     `https://api.stlouisfed.org/fred/series/observations` +
@@ -108,38 +134,32 @@ async function fredLatestN(seriesId: string, apiKey: string, need: number): Prom
       if (out.length >= need) break;
     }
   }
-  if (out.length < need) {
-    throw new Error(`Not enough valid observations for ${seriesId} (need ${need}, got ${out.length})`);
-  }
+  if (out.length < need) throw new Error(`Not enough valid observations for ${seriesId}`);
   return out; // newest -> older
 }
 
-// ---------------- MOF (JP10Y by pattern + fixed column) ----------------
-
-async function mofLatestN_JP10Y(need: number): Promise<Point[]> {
-  const res = await fetch(MOF_JGBCM_CSV, { cache: "no-store" });
+// ---------- BOJ JP10Y (direct link) ----------
+// Expect text/CSV/TSV with date in first column and value in second column.
+// We accept many formats; pick newest 60 valid points.
+async function bojLatestN_JP10Y(bojUrl: string, need: number): Promise<Point[]> {
+  const res = await fetch(bojUrl, { cache: "no-store" });
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new Error(`MOF CSV fetch failed: ${res.status} ${t.slice(0, 200)}`);
+    throw new Error(`BOJ JP10Y fetch failed: ${res.status} ${t.slice(0, 200)}`);
   }
+  const text = await res.text();
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
-  const buf = await res.arrayBuffer();
-  const csvText = decodeCsv(buf);
-
-  const rawLines = csvText.split(/\r?\n/);
-  const lines = rawLines.map((l) => l.trim()).filter((l) => l.length > 0);
-  if (lines.length < 5) throw new Error("MOF CSV: too few lines");
-
-  // Scan from bottom to top, pick lines whose col0 is date-like.
+  // Parse from bottom to top (newest first) using date pattern
   const out: Point[] = [];
   for (let i = lines.length - 1; i >= 0; i--) {
     const cols = splitRow(lines[i]);
-    if (cols.length <= MOF_TENOR_10Y_INDEX) continue;
+    if (cols.length < 2) continue;
 
-    const iso = parseDateToISO(cols[0]);
-    if (!iso) continue; // not a data row
+    const iso = parseDateToISO(cols[0]) ?? parseJapaneseEraDateToISO(cols[0]);
+    if (!iso) continue;
 
-    const v = safeNumber(cols[MOF_TENOR_10Y_INDEX]);
+    const v = safeNumber(cols[1]);
     if (v === null) continue;
 
     out.push({ date: iso, value: v });
@@ -147,48 +167,67 @@ async function mofLatestN_JP10Y(need: number): Promise<Point[]> {
   }
 
   if (out.length < need) {
-    // Include some head lines for debugging
-    const head20 = lines.slice(0, 20).join("\\n").slice(0, 800);
-    throw new Error(
-      `MOF CSV: not enough JP10Y data rows (need ${need}, got ${out.length}). ` +
-      `Check fixed index=${MOF_TENOR_10Y_INDEX}. head20=${head20}`
-    );
+    throw new Error(`BOJ JP10Y: not enough valid rows (need ${need}, got ${out.length})`);
   }
-
   return out; // newest -> older
 }
 
-// ---------------- Alignment (by common dates) ----------------
+// ---------- MOF fallback (historical daily) ----------
+// Use jgbcm_all.csv which contains daily rows with date in first column (era-style) and 10Y around col 10/11.
+// The header line includes "基準日,1年,2年,...,10年,..."
+async function mofFallbackLatestN_JP10Y(need: number): Promise<Point[]> {
+  const res = await fetch(MOF_ALL_DAILY, { cache: "no-store" });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`MOF all.csv fetch failed: ${res.status} ${t.slice(0, 200)}`);
+  }
+  const text = await res.text();
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
-function alignByDate(us: Point[], jp: Point[], need: number) {
-  const usMap = new Map(us.map((p) => [p.date, p.value]));
-  const jpMap = new Map(jp.map((p) => [p.date, p.value]));
-
-  const commonDates = us
-    .map((p) => p.date) // newest -> older
-    .filter((d) => jpMap.has(d));
-
-  const aligned: { date: string; us: number; jp: number; spread: number }[] = [];
-  for (const d of commonDates) {
-    const u = usMap.get(d);
-    const j = jpMap.get(d);
-    if (u === undefined || j === undefined) continue;
-    aligned.push({ date: d, us: u, jp: j, spread: u - j });
-    if (aligned.length >= need) break;
+  // Find header row containing "基準日" and "10年"
+  let headerIdx = -1;
+  let tenIdx = -1;
+  for (let i = 0; i < Math.min(lines.length, 20); i++) {
+    const cols = splitRow(lines[i]);
+    if (cols.length < 10) continue;
+    const joined = cols.join(",");
+    if (joined.includes("基準日") && joined.includes("10年")) {
+      headerIdx = i;
+      tenIdx = cols.findIndex(c => c.includes("10年"));
+      break;
+    }
+  }
+  if (headerIdx < 0 || tenIdx < 0) {
+    throw new Error("MOF all.csv: header not found (基準日/10年)");
   }
 
-  if (aligned.length < need) {
-    throw new Error(
-      `Not enough common dates to align (need ${need}, got ${aligned.length}). ` +
-      `Tip: holidays/calendar mismatch can reduce overlap; we already fetch extra points.`
-    );
+  const data = lines.slice(headerIdx + 1);
+
+  const out: Point[] = [];
+  for (let i = data.length - 1; i >= 0; i--) {
+    const cols = splitRow(data[i]);
+    if (cols.length <= tenIdx) continue;
+
+    const iso =
+      parseDateToISO(cols[0]) ??
+      parseJapaneseEraDateToISO(cols[0]);
+
+    if (!iso) continue;
+
+    const v = safeNumber(cols[tenIdx]);
+    if (v === null) continue;
+
+    out.push({ date: iso, value: v });
+    if (out.length >= need) break;
   }
 
-  return aligned; // newest -> older
+  if (out.length < need) {
+    throw new Error(`MOF all.csv: not enough JP10Y rows (need ${need}, got ${out.length})`);
+  }
+  return out; // newest -> older
 }
 
-// ---------------- API ----------------
-
+// ---------- API ----------
 export async function GET(_req: NextRequest) {
   try {
     const apiKey = process.env.FRED_API_KEY || "";
@@ -196,16 +235,28 @@ export async function GET(_req: NextRequest) {
       return NextResponse.json({ error: "FRED_API_KEY missing", version: VERSION }, { status: 500 });
     }
 
-    // fetch extra points to survive holidays/calendar mismatches
-    const usRaw = await fredLatestN(FRED_US10Y, apiKey, 60);
-    const jpRaw = await mofLatestN_JP10Y(60);
+    // US from FRED
+    const usRaw = await fredLatestN(FRED_US10Y, apiKey, 80);
 
-    // need 6 aligned points for 5 business-day trend
+    // JP: BOJ if URL provided, else MOF fallback
+    const bojUrl = (process.env.BOJ_JP10Y_URL || "").trim();
+    let jpRaw: Point[] = [];
+    let jpSource = "";
+
+    if (bojUrl) {
+      jpRaw = await bojLatestN_JP10Y(bojUrl, 80);
+      jpSource = "BOJ";
+    } else {
+      jpRaw = await mofFallbackLatestN_JP10Y(80);
+      jpSource = "MOF_fallback_all";
+    }
+
+    // align by common dates and compute 5D trend
     const aligned6 = alignByDate(usRaw, jpRaw, 6);
 
-    const spread6 = aligned6.map((x) => x.spread);
-    const us6 = aligned6.map((x) => x.us);
-    const jp6 = aligned6.map((x) => x.jp);
+    const spread6 = aligned6.map(x => x.spread);
+    const us6 = aligned6.map(x => x.us);
+    const jp6 = aligned6.map(x => x.jp);
 
     const tSpread = calcTrend5(spread6);
     const tUs = calcTrend5(us6);
@@ -222,45 +273,32 @@ export async function GET(_req: NextRequest) {
           source: "FRED",
           date: latest.date,
           value: latest.us,
-          last6: aligned6.map((x) => ({ date: x.date, value: x.us })),
+          last6: aligned6.map(x => ({ date: x.date, value: x.us })),
         },
         jp10y: {
-          id: "MOF_JP10Y_FIXEDCOL",
-          source: "MOF",
+          id: jpSource === "BOJ" ? "BOJ_JP10Y" : "MOF_JP10Y",
+          source: jpSource,
           date: latest.date,
           value: latest.jp,
-          last6: aligned6.map((x) => ({ date: x.date, value: x.jp })),
-          notes: { fixedColIndex10Y: MOF_TENOR_10Y_INDEX },
+          last6: aligned6.map(x => ({ date: x.date, value: x.jp })),
         },
       },
       spread10y: {
         date: latest.date,
         value: tSpread.latest,
         unit: "pct_points",
-        last6: aligned6.map((x) => ({ date: x.date, value: x.spread })),
+        last6: aligned6.map(x => ({ date: x.date, value: x.spread })),
       },
       trend5d: {
-        spread: {
-          delta5: tSpread.delta5,
-          avgDaily: tSpread.avgDaily,
-          consecutive: tSpread.consecutive,
-        },
-        us10y: {
-          delta5: tUs.delta5,
-          avgDaily: tUs.avgDaily,
-          consecutive: tUs.consecutive,
-        },
-        jp10y: {
-          delta5: tJp.delta5,
-          avgDaily: tJp.avgDaily,
-          consecutive: tJp.consecutive,
-        },
+        spread: tSpread,
+        us10y: tUs,
+        jp10y: tJp,
       },
       notes: {
-        jp_source: "MOF jgbcm.csv (daily). Data rows detected by date pattern; 10Y read from fixed column index.",
-        alignment: "US & JP aligned by common dates before computing 5-business-day trend.",
+        jp_source_behavior: "If BOJ_JP10Y_URL is set, use BOJ. Otherwise use MOF historical daily (jgbcm_all.csv) as official fallback.",
       },
     });
+
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "error", version: VERSION }, { status: 500 });
   }
