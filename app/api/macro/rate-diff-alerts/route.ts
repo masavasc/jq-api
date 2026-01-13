@@ -4,21 +4,6 @@ function fmt(n: number, digits = 2) {
   return Number.isFinite(n) ? n.toFixed(digits) : String(n);
 }
 
-function labelFor(delta5: number, consecutive: string) {
-  const TH = 0.10; // 10bp
-  if (consecutive === "shrinking" && delta5 <= -TH) return "円高警戒";
-  if (consecutive === "widening" && delta5 >= +TH) return "円安継続";
-  if (delta5 <= -TH) return "円高警戒（弱）";
-  if (delta5 >= +TH) return "円安継続（弱）";
-  return "中立";
-}
-
-function iconFor(label: string) {
-  if (label.startsWith("円高警戒")) return "🟢";
-  if (label.startsWith("円安継続")) return "🔴";
-  return "🟡";
-}
-
 async function postSlack(webhook: string, text: string) {
   const r = await fetch(webhook, {
     method: "POST",
@@ -26,9 +11,7 @@ async function postSlack(webhook: string, text: string) {
     body: JSON.stringify({ text }),
   });
   const body = await r.text().catch(() => "");
-  if (!r.ok) {
-    throw new Error(`Slack post failed: ${r.status} ${body.slice(0, 200)}`);
-  }
+  if (!r.ok) throw new Error(`Slack post failed: ${r.status} ${body.slice(0, 200)}`);
 }
 
 export async function GET(req: NextRequest) {
@@ -50,85 +33,50 @@ export async function GET(req: NextRequest) {
         : "https://jq-api.vercel.app";
 
   const url = `${baseUrl}/api/macro/rate-diff`;
-
   try {
-    // --- rate-diff を取得（失敗したら Slack に警告を送る） ---
     const res = await fetch(url, { cache: "no-store" });
-    const text = await res.text();
-    const ct = res.headers.get("content-type") || "";
+    const json = await res.json();
 
-    if (!res.ok) {
-      const msg =
-`⚠️ 日米金利差レポート取得エラー（rate-diff）
-status: ${res.status}
-content-type: ${ct}
-url: ${url}
-body(head): ${text.slice(0, 200)}`;
-      await postSlack(webhook, msg);
-      return NextResponse.json({ ok: false, sent: true, error: "rate-diff fetch failed" }, { status: 200 });
+    if (!json.ok) {
+      await postSlack(webhook, `⚠️ macro/rate-diff error: ${json.error}\n${url}`);
+      return NextResponse.json({ ok: false, sent: true }, { status: 200 });
     }
 
-    if (!ct.includes("application/json")) {
-      const msg =
-`⚠️ 日米金利差レポート取得エラー（JSONではありません）
-content-type: ${ct}
-url: ${url}
-body(head): ${text.slice(0, 200)}`;
-      await postSlack(webhook, msg);
-      return NextResponse.json({ ok: false, sent: true, error: "non-json response" }, { status: 200 });
-    }
+    const label = json.label;
+    const icon = json.icon;
 
-    const json = JSON.parse(text);
+    const us = json.primary.us10y;
+    const fx = json.helpers.usdjpy;
+    const jb = json.helpers.jgbl;
 
-    const us = json.series.us10y;
-    const jp = json.series.jp10y;
-    const sp = json.spread10y;
+    const usT = us.trend5d;
+    const jbT = jb.trend5d;
 
-    const tr = json.trend5d?.spread;
-    const trUs = json.trend5d?.us10y;
-    const trJp = json.trend5d?.jp10y;
-
-    const delta5 = Number(tr?.delta5);
-    const avgDaily = Number(tr?.avgDaily);
-    const consecutive = String(tr?.consecutive || "mixed");
-
-    const consLabel =
-      consecutive === "shrinking" ? "5日連続：縮小" :
-      consecutive === "widening" ? "5日連続：拡大" :
-      "5日連続：混在";
-
-    const label = labelFor(delta5, consecutive);
-    const icon = iconFor(label);
+    const fxRet5Pct = fx.ret5 * 100;
 
     const msg =
-`${icon}【${label}】日米金利差（10年）
+`${icon}【${label}】米金利主導＋補助条件（為替・国債先物）
 
 US10Y: ${fmt(us.value)}% (${us.date})
-JP10Y: ${fmt(jp.value)}% (${jp.date}) [${jp.source ?? "MOF"}]
-Spread: ${fmt(sp.value)}%pt
+US10Y Δ5: ${fmt(usT.delta5)}%pt / avg: ${fmt(usT.avgDaily)}%pt/day
+US10Y 5日連続: ${usT.consecutive}
 
-📉 5営業日トレンド
-Δ5: ${fmt(delta5)}%pt / avg: ${fmt(avgDaily)}%pt/day
-${consLabel}
-内訳：US Δ5 ${fmt(Number(trUs?.delta5))} / JP Δ5 ${fmt(Number(trJp?.delta5))}
+USD/JPY: ${fmt(fx.value)} (${fx.date})
+USD/JPY 5日変化: ${fmt(fxRet5Pct, 2)}%
+
+^JGBL: ${fmt(jb.value)} (${jb.date})
+^JGBL Δ5: ${fmt(jbT.delta5)} / avg: ${fmt(jbT.avgDaily)}
+^JGBL 5日連続: ${jbT.consecutive}
 
 参照:
 ${url}`;
 
     await postSlack(webhook, msg);
-    return NextResponse.json({ ok: true, sent: true, label }, { status: 200 });
+    return NextResponse.json({ ok: true, sent: true }, { status: 200 });
 
   } catch (e: any) {
-    // --- ここで落ちても必ず Slack に出す ---
-    const msg =
-`⚠️ 日米金利差アラート内部エラー（rate-diff-alerts）
-message: ${e?.message ?? "unknown"}
-url: ${url}`;
-    try {
-      await postSlack(webhook, msg);
-    } catch {
-      // Slackすら落ちたら返すしかない
-    }
+    const msg = `⚠️ rate-diff-alerts internal error: ${e?.message ?? "error"}\n${url}`;
+    try { await postSlack(webhook, msg); } catch {}
     return NextResponse.json({ ok: false, error: e?.message ?? "error" }, { status: 500 });
   }
 }
