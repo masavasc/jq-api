@@ -33,6 +33,7 @@ export async function GET(req: NextRequest) {
         : "https://jq-api.vercel.app";
 
   const url = `${baseUrl}/api/macro/rate-diff`;
+
   try {
     const res = await fetch(url, { cache: "no-store" });
     const json = await res.json();
@@ -42,17 +43,35 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ ok: false, sent: true }, { status: 200 });
     }
 
-    const label = json.label;
-    const icon = json.icon;
+    // --- new format ---
+    const label: string = json.label || "（labelなし）";
+    const icon: string = json.icon || "🟡";
 
-    const us = json.primary.us10y;
-    const fx = json.helpers.usdjpy;
-    const jb = json.helpers.jgbl;
+    const us = json.primary?.us10y;
+    const fx = json.helpers?.usdjpy;
+    const jb = json.helpers?.jgbl;
+
+    if (!us?.trend5d || typeof fx?.ret5 !== "number") {
+      await postSlack(webhook, `⚠️ macro/rate-diff format mismatch\n${url}\njson(head): ${JSON.stringify(json).slice(0, 400)}`);
+      return NextResponse.json({ ok: false, sent: true }, { status: 200 });
+    }
 
     const usT = us.trend5d;
-    const jbT = jb.trend5d;
-
     const fxRet5Pct = fx.ret5 * 100;
+
+    let jgblBlock = "";
+    if (jb?.available === false) {
+      jgblBlock =
+`^JGBL: unavailable（${jb.note || "no data"}）`;
+    } else if (jb?.available === true && jb?.trend5d) {
+      const jbT = jb.trend5d;
+      jgblBlock =
+`^JGBL: ${fmt(jb.value)} (${jb.date})
+^JGBL Δ5: ${fmt(jbT.delta5)} / avg: ${fmt(jbT.avgDaily)}
+^JGBL 5日連続: ${jbT.consecutive}`;
+    } else {
+      jgblBlock = `^JGBL: (unknown format)`;
+    }
 
     const msg =
 `${icon}【${label}】米金利主導＋補助条件（為替・国債先物）
@@ -64,9 +83,7 @@ US10Y 5日連続: ${usT.consecutive}
 USD/JPY: ${fmt(fx.value)} (${fx.date})
 USD/JPY 5日変化: ${fmt(fxRet5Pct, 2)}%
 
-^JGBL: ${fmt(jb.value)} (${jb.date})
-^JGBL Δ5: ${fmt(jbT.delta5)} / avg: ${fmt(jbT.avgDaily)}
-^JGBL 5日連続: ${jbT.consecutive}
+${jgblBlock}
 
 参照:
 ${url}`;
